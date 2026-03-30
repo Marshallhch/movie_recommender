@@ -382,7 +382,8 @@ async def tfidf_recommend(title: str=Query(..., min_length=1), top_n: int=Query(
   return [{"title": t, "score": s} for t, s in recs]
 
 # 번들용 추천 종합: details + tfidf + genre recommend
-@app.get('movie/search', response_model=SearchBundleResponse)
+# http://localhost:8000/movie/search?query=avatar&tfidf_top_n=5&genre_top_n=5
+@app.get('/movie/search', response_model=SearchBundleResponse)
 async def search_bundle(
   query: str = Query(..., min_length=1),
   tfidf_top_n: int = Query(10, ge=1, le=20),
@@ -394,7 +395,53 @@ async def search_bundle(
   - TF-IDF 기반 추천(로컬) + 포스터
   - 장르 기반 추천(TMDB) + 포스터
   """
-  pass
+  # query로 입력되는 영화에 가장 첫번째 데이터 저장
+  best = await tmdb_search_first(query)
+  if not best:
+    raise HTTPException(status_code=404, detail=f'No TMDB movie found for query: {query}')
+
+  tmdb_id = int(best['id'])
+
+  # 영화 상세 정보
+  details = await tmdb_movie_details(tmdb_id)
+
+  # TF-IDF 기반 추천
+  tfidf_items: List[TFIDFRecItem] = []
+  recs: List[Tuple[str, float]] = [] # 타이틀, 스코어
+
+  try:
+    recs = tfidf_recommend_titles(details.title, top_n=tfidf_top_n)
+  except Exception:
+    # TMDB에서 찾은 제목으로 TF-IDF 추천 시도하고, 실패 시 사용자 입력으로 추천 시도
+    try:
+      recs = tfidf_recommend_titles(query, top_n=tfidf_top_n)
+    except Exception:
+      recs = []
+
+  for title, score in recs:
+    card = await attach_tmdb_card_by_title(title)
+    tfidf_items.append(TFIDFRecItem(title=title, score=score, tmdb=card))
+
+  # 장르 기반 추천
+  genre_recs: List[TMDBMovieCard] = []
+  if details.genres:
+    genre_id = details.genres[0]['id']
+    discover = await tmdb_get('/discover/movie', {
+      "with_genres": genre_id,
+      "language": "ko-KR",
+      "sort_by": "popularity.desc",
+      "page": 1
+    })
+
+    cards = await tmdb_card_from_results(discover.get("results", []), limit=genre_top_n)
+    genre_recs = [c for c in cards if c.tmdb_id != tmdb_id] # 자신과 같은 영화 제외
+  
+  return SearchBundleResponse(
+    query=query,
+    movie_details=details,
+    tfidf_recommendations=tfidf_items,
+    genre_recommendations=genre_recs
+  )
 
 if __name__ == "__main__":
   import uvicorn
