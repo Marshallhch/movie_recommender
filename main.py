@@ -1,7 +1,7 @@
 import os
 import pickle
 import numpy as np
-import pandas as pdb
+import pandas as pd
 import httpx # 비동기 http 클라이언트: tmdb api 호출에 사용
 
 from contextlib import asynccontextmanager # FastAPI의 수명 주기를 관리하기 위한 비동기 컨텍스트 관리자
@@ -44,7 +44,7 @@ INDICES_PATH = os.path.join(BASE_DIR, "data", "indices.pkl")
 TFIDF_MATRIX_PATH = os.path.join(BASE_DIR, "data", "tfidf_matrix.pkl")
 TFIDF_PATH = os.path.join(BASE_DIR, "data", "tfidf.pkl")
 
-# 타입 초기화
+# 변수 및 타입 초기화
 df: Optional[pd.DataFrame] = None
 indices_obj: Any = None 
 
@@ -280,3 +280,122 @@ async def attach_tmdb_card_by_title(title: str) -> Optional[TMDBMovieCard]:
 
   except Exception:
     return None
+
+# Load Pickle Files
+def load_pickles():
+  global df, indices_obj, tfidf_matrix, tfidf_obj, TITLE_TO_IDX
+
+  # load df
+  with open(DF_PATH, "rb") as f:
+    df = pickle.load(f)
+
+  # load indices
+  with open(INDICES_PATH, "rb") as f:
+    indices_obj = pickle.load(f)
+
+  # load TF-IDF matrix
+  with open(TFIDF_MATRIX_PATH, "rb") as f:
+    tfidf_matrix = pickle.load(f)
+
+  # load tfidf vectorizer (optional, not used directly here)
+  with open(TFIDF_PATH, "rb") as f:
+    tfidf_obj = pickle.load(f)
+
+  # build normalized map
+  TITLE_TO_IDX = build_title_to_idx_map(indices_obj)
+
+  # sanity
+  if df is None or "title" not in df.columns:
+    raise RuntimeError("df.pkl must contain a DataFrame with a 'title' column")
+
+# FastAPI endpoint
+
+# 초기 화면 로드 시 엔드포인트
+@app.get('/home', response_model=List[TMDBMovieCard])
+async def home(
+  category: str = Query('trending'),
+  limit: int = Query(20, ge=1, le=50) # 기본값, 최소값, 최대값
+):
+  """
+  인기순으로 영화 목록 추출
+  """
+  try:
+    if category == "trending":
+      data = await tmdb_get("/trending/movie/day", {"language": "ko-KR"})
+      return await tmdb_card_from_results(data.get('results', []), limit=limit)
+
+    if category not in {'popular', 'top_rated', 'upcoming', 'now-playing'}:
+      raise HTTPException(status_code=400, detail="Invalide category")
+
+    data = await tmdb_get(f'/movie/{category}, {"language": "ko-KR", "page": 1}')
+    return await tmdb_card_from_results(data.get('results', []), limit=limit)
+  except HTTPException:
+    raise HTTPException(status_code=502, detail="TMDB request error")
+
+# 키워드 검색
+@app.get('/tmdb/search')
+async def tmdb_search(query: str=Query(..., min_length=1), page: int=Query(1, ge=1, le=10)):
+  """
+  키워드로 영화 검색
+  """
+  return await tmdb_search_movies(query=query, page=page)
+
+# movie details 엔드포인트
+@app.get('/movie/id/{tmdb_id}', response_model=TMDBMovieDetails)
+async def movie_details_route(tmdb_id: int):
+  """
+  TMDB 아이디로 영화 상세 정보 조회
+  """
+  return await tmdb_movie_details(tmdb_id)
+
+# 장르 추천 엔드포인트: TODO - 같은 영화만 나오는 부분 수정
+@app.get('/recommend/genre', response_model=List[TMDBMovieCard])
+async def recommend_genre(tmdb_id: int=Query(...), limit: int=Query(10, ge=1, le=20)):
+  """
+  TMDB 아이디를 기반으로 장르 추천
+  - details 정보 조회
+  - 첫 번째 장르 선택
+  - 주어진 장르로 부터 인기순으로 영화 목록 반환
+  """
+  details = await tmdb_movie_details(tmdb_id)
+  if not details.genres:
+    return []
+
+  genre_id = details.genres[0]['id']
+  discover = await tmdb_get('/discover/movie', {
+    "with_genre": genre_id,
+    "language": "ko-KR",
+    "sort_by": 'popularity.desc',
+    "page": 1
+  })
+
+  cards = await tmdb_card_from_results(discover.get('results', []), limit=limit)
+  return [c for c in cards if c.tmdb_id != tmdb_id] # 자신과 같은 영화 제외
+
+# TF_IDF 확인용 엔드포인트
+@app.get('/recommend/tfidf')
+async def tfidf_recommend(title: str=Query(..., min_length=1), top_n: int=Query(10, ge=1, le=10)):
+  """
+  TF-IDF 기반 영화 추천 스코어 확인
+  """
+  recs = tfidf_recommend_titles(title, top_n=top_n)
+  return [{"title": t, "score": s} for t, s in recs]
+
+# 번들용 추천 종합: details + tfidf + genre recommend
+@app.get('movie/search', response_model=SearchBundleResponse)
+async def search_bundle(
+  query: str = Query(..., min_length=1),
+  tfidf_top_n: int = Query(10, ge=1, le=20),
+  genre_top_n: int = Query(10, ge=1, le=20),
+):
+  """
+  입력한 영화에 대해
+  - 영화 상세 정보
+  - TF-IDF 기반 추천(로컬) + 포스터
+  - 장르 기반 추천(TMDB) + 포스터
+  """
+  pass
+
+if __name__ == "__main__":
+  import uvicorn
+  uvicorn.run('main:app', host="0.0.0.0", port=8000, reload=True)
